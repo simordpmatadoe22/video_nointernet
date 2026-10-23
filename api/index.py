@@ -1,18 +1,23 @@
 
 import os
 import re
+import json
 import hmac
 import hashlib
-import requests
-
-from flask import Flask, request
+import logging
+import html
 from urllib.parse import urlparse, urljoin
 
-app = Flask(__name__)
+import requests
+from flask import Flask, request, jsonify
 
-# =====================================
-# CONFIGURATION
-# =====================================
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# =========================
+# إعدادات Meta
+# =========================
+
 
 PAGE_ACCESS_TOKEN = "EAATLbkq5LgwBS75x08zMQMhuyOQZCvQ2KVK8ciKcZBJfjlkuZC7Uo9V9R3I4r17tIFvRL6aHW2GWZAVTWQYaidkHXAanZCopUcVQZCenBq6FRfpm4WyGiDNmdRA3TXuGtZBSSvESUHqXcTZAYmGCup7IAEYXO5CAcUD5S2S1jbyHGYk5KrZAyVQvxZAaPyiblXxes784z7cAZDZD"
 VERIFY_TOKEN = "ABCD1234"
@@ -20,98 +25,45 @@ APP_SECRET = "e3fa1ca2e5e3ad34dd6624bc3d3f1979"
 
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v23.0")
 
-GRAPH_URL = (
-    f"https://graph.facebook.com/"
-    f"{GRAPH_VERSION}/me/messages"
+GRAPH_MESSAGES_URL = (
+    f"https://graph.facebook.com/{GRAPH_VERSION}/me/messages"
 )
 
-# =====================================
-# HTTP SESSION
-# =====================================
+# =========================
+# Headers ديال Facebook
+# =========================
 
-session = requests.Session()
-
-session.headers.update({
+FB_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 10; "
-        "DevHilal Build/HUAWEIDRA-Hilal; wv) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Version/4.0 Chrome/88.0.4324.93 "
-        "Mobile Safari/537.36 "
+        "Mozilla/5.0 (Linux; Android 10; DevHilal Build/HUAWEIDRA-Hilal; "
+        "wv) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Version/4.0 Chrome/88.0.4324.93 Mobile Safari/537.36 "
         "[FBAN/EMA;FBLC/ar_AR;FB_WAB/368.0.0.5.95]"
     ),
     "Accept": (
-        "text/html,application/xhtml+xml,"
-        "application/xml;q=0.9,*/*;q=0.8"
-    )
-})
-
-# =====================================
-# VERIFY META SIGNATURE
-# =====================================
-
-def verify_signature(body, signature):
-    if not signature or not signature.startswith("sha256="):
-        return False
-
-    expected = hmac.new(
-        APP_SECRET.encode("utf-8"),
-        body,
-        hashlib.sha256
-    ).hexdigest()
-
-    return hmac.compare_digest(
-        expected,
-        signature.split("=", 1)[1]
-    )
-
-
-# =====================================
-# SEND MESSENGER MESSAGE
-# =====================================
-
-def send_text(psid, text):
-    try:
-        response = requests.post(
-            GRAPH_URL,
-            params={"access_token": PAGE_ACCESS_TOKEN},
-            json={
-                "recipient": {"id": psid},
-                "messaging_type": "RESPONSE",
-                "message": {"text": text}
-            },
-            timeout=15
-        )
-
-        if not response.ok:
-            print(
-                "Messenger API error:",
-                response.status_code,
-                response.text[:300]
-            )
-            return False
-
-        return True
-
-    except requests.RequestException as exc:
-        print("Send error:", str(exc))
-        return False
-
-
-# =====================================
-# FACEBOOK URL VALIDATION
-# =====================================
-
-ALLOWED_HOSTS = {
-    "facebook.com",
-    "www.facebook.com",
-    "m.facebook.com",
-    "web.facebook.com",
-    "fb.com",
-    "www.fb.com",
-    "fb.watch",
-    "www.fb.watch"
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    ),
 }
+
+session = requests.Session()
+session.headers.update(FB_HEADERS)
+
+# =========================
+# التحقق من الدومينات
+# =========================
+
+FACEBOOK_HOSTS = (
+    "facebook.com",
+    "fb.watch",
+)
+
+def host_is(host, allowed_domains):
+    host = (host or "").lower().rstrip(".")
+
+    return any(
+        host == domain or host.endswith("." + domain)
+        for domain in allowed_domains
+    )
 
 
 def is_facebook_url(url):
@@ -119,80 +71,268 @@ def is_facebook_url(url):
         parsed = urlparse(url)
 
         return (
-            parsed.scheme == "https"
-            and parsed.hostname in ALLOWED_HOSTS
-            and parsed.username is None
-            and parsed.password is None
+            parsed.scheme in ("http", "https")
+            and host_is(parsed.hostname, FACEBOOK_HOSTS)
         )
-
-    except (ValueError, AttributeError):
+    except Exception:
         return False
 
 
-def extract_facebook_link(text):
-    if not text:
-        return None
+def is_video_cdn_url(url):
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.lower()
 
-    pattern = (
-        r'https?://(?:www\.|m\.|web\.)?facebook\.com/[^\s<>"\']+'
-        r'|https?://(?:www\.)?fb\.watch/[^\s<>"\']+'
-        r'|https?://(?:www\.)?fb\.com/[^\s<>"\']+'
-    )
+        return (
+            parsed.scheme in ("http", "https")
+            and (
+                host_is(host, ("fbcdn.net",))
+                or host.startswith("video.")
+                or host.startswith("video-")
+                or host.startswith("z-m-video.")
+                or host.startswith("z-m-video-")
+            )
+            and (
+                path.endswith(".mp4")
+                or "video" in host
+                or "z-m-video" in host
+            )
+        )
+    except Exception:
+        return False
 
-    match = re.search(pattern, text, re.IGNORECASE)
 
-    if not match:
-        return None
-
-    url = match.group(0).rstrip(".,!?) ]}")
-
-    if not is_facebook_url(url):
-        return None
-
-    return url
-
-
-# =====================================
-# TRANSFORM VIDEO URL
-# =====================================
+# =========================
+# تبديل صيغة رابط الفيديو
+# =========================
 
 def transform_video_url(url):
-    return (
-        url.replace(
-            "https://video.",
-            "https://z-m-video."
-        ).replace(
-            "http://video.",
-            "https://z-m-video."
-        )
+    if not isinstance(url, str):
+        return url
+
+    url = url.strip()
+
+    # video.example.com  -> z-m-video.example.com
+    # video-iad6-1.xx...  -> z-m-video-iad6-1.xx...
+    # كيحافظ على المسار و query parameters
+
+    return re.sub(
+        r"^https?://video([.-])",
+        r"https://z-m-video\1",
+        url,
+        count=1,
+        flags=re.IGNORECASE,
     )
 
 
-# =====================================
-# FIND browser_native_hd_url IN JSON
-# =====================================
+# =========================
+# إرسال رسالة إلى Messenger
+# =========================
 
-def find_browser_native_hd_url(data):
+def send_text(sender_id, text):
+    if not sender_id:
+        return False
+
+    payload = {
+        "recipient": {
+            "id": str(sender_id)
+        },
+        "messaging_type": "RESPONSE",
+        "message": {
+            "text": str(text)[:2000]
+        }
+    }
+
+    try:
+        response = requests.post(
+            GRAPH_MESSAGES_URL,
+            params={"access_token": PAGE_ACCESS_TOKEN},
+            json=payload,
+            timeout=20,
+        )
+
+        if not response.ok:
+            logging.error(
+                "Messenger API error: %s",
+                response.text[:1000],
+            )
+            return False
+
+        return True
+
+    except requests.RequestException:
+        logging.exception("Failed to send Messenger message")
+        return False
+
+
+# =========================
+# استخراج الروابط من payload
+# =========================
+
+def find_urls_in_payload(data):
+    found = []
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+
+                key_lower = str(key).lower()
+
+                if (
+                    isinstance(value, str)
+                    and (
+                        "url" in key_lower
+                        or "href" in key_lower
+                        or "link" in key_lower
+                    )
+                ):
+                    candidate = value.strip()
+
+                    if candidate.startswith(("https://", "http://")):
+                        found.append(candidate)
+
+                walk(value)
+
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(data)
+
+    # حذف التكرار مع الحفاظ على الترتيب
+    return list(dict.fromkeys(found))
+
+
+def extract_urls_from_text(text_value):
+    if not isinstance(text_value, str):
+        return []
+
+    urls = re.findall(r"https?://[^\s<>\"']+", text_value)
+
+    cleaned = []
+
+    for url in urls:
+        url = url.rstrip(".,;!?)\u3002")
+
+        if url:
+            cleaned.append(url)
+
+    return list(dict.fromkeys(cleaned))
+
+
+# =========================
+# جلب صفحة Facebook بأمان
+# =========================
+
+def fetch_facebook_page(url):
+    current_url = url
+
+    for _ in range(6):
+        if not is_facebook_url(current_url):
+            logging.warning("Rejected non-Facebook URL")
+            return None
+
+        response = None
+
+        try:
+            response = session.get(
+                current_url,
+                allow_redirects=False,
+                stream=True,
+                timeout=(10, 20),
+            )
+
+            # تتبع التحويلات يدويا مع التحقق من الدومين
+            if response.is_redirect or response.is_permanent_redirect:
+                location = response.headers.get("Location")
+
+                if not location:
+                    return None
+
+                current_url = urljoin(current_url, location)
+                continue
+
+            if response.status_code != 200:
+                logging.warning(
+                    "Facebook returned status %s",
+                    response.status_code,
+                )
+                return None
+
+            content_type = response.headers.get(
+                "Content-Type", ""
+            ).lower()
+
+            if not any(
+                kind in content_type
+                for kind in (
+                    "text/html",
+                    "application/json",
+                    "text/plain",
+                    "application/xhtml+xml",
+                )
+            ):
+                return None
+
+            # حد أقصى 5MB لتفادي تحميل صفحات ضخمة
+            chunks = []
+            total_size = 0
+            max_size = 5 * 1024 * 1024
+
+            for chunk in response.iter_content(65536):
+                if not chunk:
+                    continue
+
+                total_size += len(chunk)
+
+                if total_size > max_size:
+                    logging.warning("Facebook response too large")
+                    return None
+
+                chunks.append(chunk)
+
+            encoding = response.encoding or "utf-8"
+
+            return b"".join(chunks).decode(
+                encoding,
+                errors="replace",
+            )
+
+        except requests.RequestException:
+            logging.exception("Failed to fetch Facebook page")
+            return None
+
+        finally:
+            if response is not None:
+                response.close()
+
+    return None
+
+
+# =========================
+# البحث عن browser_native_hd_url
+# =========================
+
+def find_hd_url_in_json(data):
     if isinstance(data, dict):
-
-        value = data.get("browser_native_hd_url")
-
-        if isinstance(value, str):
-            value = value.replace("\\/", "/")
-
-            if value.startswith(("https://", "http://")):
+        for key, value in data.items():
+            if (
+                key == "browser_native_hd_url"
+                and isinstance(value, str)
+                and value.startswith(("https://", "http://"))
+            ):
                 return value
 
-        for child in data.values():
-            result = find_browser_native_hd_url(child)
+        for value in data.values():
+            result = find_hd_url_in_json(value)
 
             if result:
                 return result
 
     elif isinstance(data, list):
-
-        for child in data:
-            result = find_browser_native_hd_url(child)
+        for item in data:
+            result = find_hd_url_in_json(item)
 
             if result:
                 return result
@@ -200,249 +340,242 @@ def find_browser_native_hd_url(data):
     return None
 
 
-# =====================================
-# GET FACEBOOK PAGE SAFELY
-# =====================================
+def extract_hd_url_from_page(page_text):
+    # أولا: محاولة قراءة JSON مباشرة
+    try:
+        data = json.loads(page_text)
+        result = find_hd_url_in_json(data)
 
-def get_facebook_page(url):
-    current_url = url
+        if result:
+            return html.unescape(result)
+    except (ValueError, TypeError):
+        pass
 
-    # Follow only a limited number of Facebook redirects.
-    for _ in range(6):
+    # ثانيا: البحث داخل HTML أو JSON مضمّن
+    pattern = (
+        r'"browser_native_hd_url"\s*:\s*'
+        r'"((?:\\.|[^"\\])*)"'
+    )
 
-        if not is_facebook_url(current_url):
-            raise ValueError("Redirect خارج نطاق Facebook")
-
-        response = session.get(
-            current_url,
-            timeout=15,
-            allow_redirects=False,
-            stream=True
-        )
-
-        if response.status_code in (301, 302, 303, 307, 308):
-            location = response.headers.get("Location")
-            response.close()
-
-            if not location:
-                raise ValueError("Redirect بلا Location")
-
-            current_url = urljoin(current_url, location)
-            continue
+    for match in re.finditer(pattern, page_text):
+        raw_value = match.group(1)
 
         try:
-            response.raise_for_status()
+            decoded = json.loads('"' + raw_value + '"')
+        except (ValueError, TypeError):
+            decoded = raw_value.replace(r"\/", "/")
 
-            content_type = response.headers.get(
-                "Content-Type", ""
-            ).lower()
+        decoded = html.unescape(decoded)
 
-            if not (
-                "text/html" in content_type
-                or "json" in content_type
-                or "text/plain" in content_type
-            ):
-                raise ValueError("نوع الاستجابة غير مدعوم")
+        if decoded.startswith(("https://", "http://")):
+            return decoded
 
-            # Prevent downloading an unexpectedly large page.
-            chunks = []
-            total = 0
-            limit = 5 * 1024 * 1024
+    return None
 
-            for chunk in response.iter_content(16384):
-                if not chunk:
-                    continue
-
-                total += len(chunk)
-
-                if total > limit:
-                    raise ValueError("استجابة Facebook كبيرة بزاف")
-
-                chunks.append(chunk)
-
-            body = b"".join(chunks)
-
-            return (
-                body.decode("utf-8", errors="replace"),
-                content_type
-            )
-
-        finally:
-            response.close()
-
-    raise ValueError("عدد التحويلات تجاوز الحد")
-
-
-# =====================================
-# EXTRACT DIRECT VIDEO URL
-# =====================================
 
 def extract_video_url(facebook_url):
-    try:
-        html, content_type = get_facebook_page(facebook_url)
-
-        # Try JSON first.
-        if "json" in content_type:
-            try:
-                result = find_browser_native_hd_url(
-                    requests.models.complexjson.loads(html)
-                )
-
-                if result:
-                    return transform_video_url(result)
-
-            except (ValueError, TypeError):
-                pass
-
-        # Search the HTML / embedded JSON.
-        patterns = [
-            r'"browser_native_hd_url"\s*:\s*"((?:\\.|[^"\\])*)"',
-            r'\\?"browser_native_hd_url\\?"\s*:\s*\\?"([^"\\]+)',
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, html)
-
-            if not match:
-                continue
-
-            video_url = match.group(1)
-
-            video_url = (
-                video_url
-                .replace("\\/", "/")
-                .replace("\\u0025", "%")
-                .replace("\\u0026", "&")
-                .replace("&amp;", "&")
-            )
-
-            if video_url.startswith(("https://", "http://")):
-                return transform_video_url(video_url)
-
-        print("browser_native_hd_url not found")
+    if not is_facebook_url(facebook_url):
         return None
 
-    except (
-        requests.RequestException,
-        ValueError
-    ) as exc:
-        print("Extraction error:", str(exc))
+    page_text = fetch_facebook_page(facebook_url)
+
+    if not page_text:
         return None
 
+    video_url = extract_hd_url_from_page(page_text)
 
-# =====================================
-# PROCESS INCOMING MESSAGE
-# =====================================
+    if video_url:
+        return transform_video_url(video_url)
 
-def process_message(event):
-    sender = event.get("sender", {}).get("id")
-    message = event.get("message", {})
+    return None
 
-    if not sender or message.get("is_echo"):
+
+# =========================
+# معالجة الرسالة والمرفقات
+# =========================
+
+def handle_message(sender_id, message):
+    if not isinstance(message, dict):
         return
 
-    # Ignore messages without text or attachments.
-    text = message.get("text", "")
+    candidates = []
+    attachment_candidates = []
 
-    # 1. Normal Facebook link sent in Messenger.
-    facebook_url = extract_facebook_link(text)
+    # 1. استخراج الروابط من نص الرسالة
+    text_value = message.get("text", "") or ""
 
-    if facebook_url:
-        send_text(
-            sender,
-            "⏳ توصلت بالرابط، كنقلب على رابط الفيديو..."
-        )
+    candidates.extend(extract_urls_from_text(text_value))
 
-        direct_url = extract_video_url(facebook_url)
+    # 2. البحث في attachments و payload بالكامل
+    attachments = message.get("attachments", []) or []
 
-        if direct_url:
-            send_text(
-                sender,
-                "✅ رابط الفيديو:\n\n" + direct_url
-            )
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+
+        payload = attachment.get("payload", {}) or {}
+        attachment_type = str(
+            attachment.get("type", "")
+        ).lower()
+
+        payload_urls = find_urls_in_payload(payload)
+
+        # روابط المرفقات نعطيها الأولوية إذا كان المرفق فيديو
+        if attachment_type == "video":
+            attachment_candidates.extend(payload_urls)
         else:
-            send_text(
-                sender,
-                "❌ ما لقيتش browser_native_hd_url.\n\n"
-                "ممكن المنشور خاص أو Facebook رجع "
-                "صفحة تسجيل الدخول أو ما كاينش رابط HD متاح."
-            )
+            candidates.extend(payload_urls)
 
+    # 3. حذف الروابط المكررة
+    attachment_candidates = list(
+        dict.fromkeys(attachment_candidates)
+    )
+
+    candidates = list(
+        dict.fromkeys(attachment_candidates + candidates)
+    )
+
+    if not candidates:
+        send_text(
+            sender_id,
+            "ما لقيتش رابط داخل الرسالة أو المرفق. "
+            "تأكد أن Messenger صيفط رابط المنشور أو الفيديو."
+        )
         return
 
-    # 2. Video attachment.
-    for attachment in message.get("attachments", []):
-        if attachment.get("type") == "video":
-            payload = attachment.get("payload", {})
-            media_url = payload.get("url", "")
+    # 4. فحص الروابط
+    for candidate in candidates:
 
-            if media_url.startswith("https://"):
-                send_text(
-                    sender,
-                    "🎬 توصلت بمرفق فيديو.\n\n"
-                    "رابط المرفق:\n" + media_url
-                    + "\n\nهاد الرابط ماشي بالضرورة رابط "
-                    "MP4 الأصلي ديال المنشور."
-                )
-            else:
-                send_text(
-                    sender,
-                    "توصلت بالفيديو، ولكن Meta ما وفرتش "
-                    "رابط مرفق قابل للاستعمال."
-                )
-
+        # رابط فيديو مباشر من CDN
+        if is_video_cdn_url(candidate):
+            result = transform_video_url(candidate)
+            send_text(sender_id, result)
             return
 
-    # 3. Other messages.
-    if text.strip():
-        send_text(
-            sender,
-            "👋 صيفط رابط Facebook أو شارك فيديو مع الصفحة."
-        )
+        # رابط منشور أو فيديو من Facebook
+        if is_facebook_url(candidate):
+            result = extract_video_url(candidate)
+
+            if result:
+                send_text(sender_id, result)
+                return
+
+    send_text(
+        sender_id,
+        "لقيت رابط، ولكن ما قدرتش نستخرج رابط MP4 مباشر. "
+        "ممكن Facebook ما أتاحش رابط الفيديو أو الصفحة كتحتاج تسجيل الدخول."
+    )
 
 
-# =====================================
-# VERCEL ROUTES
-# =====================================
+def process_messaging_event(event):
+    sender_id = (
+        event.get("sender", {}).get("id")
+        if isinstance(event.get("sender"), dict)
+        else None
+    )
+
+    message = event.get("message")
+
+    if not sender_id or not isinstance(message, dict):
+        return
+
+    # تجاهل الرسائل اللي الصفحة رسلاتها بنفسها
+    if message.get("is_echo"):
+        return
+
+    handle_message(sender_id, message)
+
+
+# =========================
+# التحقق من توقيع Meta
+# =========================
+
+def verify_signature(raw_body):
+    signature_256 = request.headers.get(
+        "X-Hub-Signature-256", ""
+    )
+
+    if signature_256.startswith("sha256="):
+        expected = hmac.new(
+            APP_SECRET.encode("utf-8"),
+            raw_body,
+            hashlib.sha256,
+        ).hexdigest()
+
+        received = signature_256.split("=", 1)[1]
+
+        return hmac.compare_digest(expected, received)
+
+    # توافق مع توقيع SHA1 القديم
+    signature_1 = request.headers.get(
+        "X-Hub-Signature", ""
+    )
+
+    if signature_1.startswith("sha1="):
+        expected = hmac.new(
+            APP_SECRET.encode("utf-8"),
+            raw_body,
+            hashlib.sha1,
+        ).hexdigest()
+
+        received = signature_1.split("=", 1)[1]
+
+        return hmac.compare_digest(expected, received)
+
+    return False
+
+
+# =========================
+# Routes ديال Vercel
+# =========================
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Facebook Video Bot is running", 200
+    return jsonify({
+        "status": "running",
+        "service": "Facebook Messenger Video Link Bot",
+    })
 
 
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
+    mode = request.args.get("hub.mode", "")
+    token = request.args.get("hub.verify_token", "")
+    challenge = request.args.get("hub.challenge", "")
 
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        return challenge or "", 200
+    if mode == "subscribe" and hmac.compare_digest(
+        token, VERIFY_TOKEN
+    ):
+        return challenge, 200
 
     return "Verification failed", 403
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    body = request.get_data()
+    raw_body = request.get_data(cache=True)
 
-    signature = request.headers.get(
-        "X-Hub-Signature-256", ""
-    )
-
-    if not verify_signature(body, signature):
+    if not verify_signature(raw_body):
+        logging.warning("Webhook signature verification failed")
         return "Invalid signature", 403
 
-    data = request.get_json(silent=True) or {}
+    try:
+        data = json.loads(raw_body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return "Invalid JSON", 400
 
     if data.get("object") != "page":
-        return "Ignored", 200
+        return "Unsupported object", 404
 
     for entry in data.get("entry", []):
         for event in entry.get("messaging", []):
             try:
-                process_message(event)
-            except Exception as exc:
-                print("Message processing error:", str(exc))
+                process_messaging_event(event)
+            except Exception:
+                logging.exception("Failed to process Messenger event")
 
     return "EVENT_RECEIVED", 200
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
